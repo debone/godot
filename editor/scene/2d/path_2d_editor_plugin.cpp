@@ -97,6 +97,15 @@ void Path2DEditor::_update_group_pivot() {
 	group_pivot_local = PointTransformGizmo2D::selection_center(pts);
 }
 
+Vector2 Path2DEditor::_get_effective_pivot_local() const {
+	// Use the canvas editor's custom pivot (Shift+V) when set, otherwise the selection centroid.
+	const Vector2 temp_pivot = CanvasItemEditor::get_singleton()->get_temp_pivot();
+	if (!Math::is_inf(temp_pivot.x) && !Math::is_inf(temp_pivot.y)) {
+		return node->get_screen_transform().affine_inverse().xform(temp_pivot);
+	}
+	return group_pivot_local;
+}
+
 void Path2DEditor::_select_point(int p_idx, bool p_append) {
 	if (p_append) {
 		if (selected_points.has(p_idx)) {
@@ -137,7 +146,7 @@ void Path2DEditor::_begin_group_transform(PointTransformGizmo2D::Mode p_mode, Po
 	group_scale_preview = Vector2();
 
 	_update_group_pivot();
-	group_drag_pivot_local = group_pivot_local;
+	group_drag_pivot_local = _get_effective_pivot_local();
 
 	group_pre_transform.clear();
 	Ref<Curve2D> curve = node->get_curve();
@@ -385,7 +394,7 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 		// Start a group transform by grabbing a gizmo handle (shift is reserved for handle editing).
 		if (gizmo_mode != PointTransformGizmo2D::Mode::NONE && !selected_points.is_empty() &&
 				mb->get_button_index() == MouseButton::LEFT && mb->is_pressed() && !mb->is_shift_pressed() && action == ACTION_NONE) {
-			const Vector2 pivot_screen = xform.xform(group_pivot_local);
+			const Vector2 pivot_screen = xform.xform(_get_effective_pivot_local());
 			const real_t basis_rot = canvas_item_editor->is_using_local_space() ? xform.get_rotation() : 0.0;
 			const PointTransformGizmo2D::HitType hit = PointTransformGizmo2D::hit_test(gizmo_mode, pivot_screen, basis_rot, gpoint);
 			if (hit != PointTransformGizmo2D::HitType::NONE) {
@@ -968,7 +977,7 @@ void Path2DEditor::forward_canvas_draw_over_viewport(Control *p_overlay) {
 	// Draw the transform gizmo for the current selection.
 	const PointTransformGizmo2D::Mode gizmo_mode = _get_gizmo_mode();
 	if (gizmo_mode != PointTransformGizmo2D::Mode::NONE && !selected_points.is_empty()) {
-		const Vector2 pivot_local = group_drag_active ? group_drag_pivot_local : group_pivot_local;
+		const Vector2 pivot_local = group_drag_active ? group_drag_pivot_local : _get_effective_pivot_local();
 		const Vector2 pivot_screen = xform.xform(pivot_local);
 		const real_t basis_rot = canvas_item_editor->is_using_local_space() ? xform.get_rotation() : 0.0;
 		const PointTransformGizmo2D::HitType active_hit = group_drag_active ? group_hit : PointTransformGizmo2D::HitType::NONE;

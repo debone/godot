@@ -151,6 +151,7 @@ protected:
 	void _select_point(const Vertex &p_vertex, bool p_append);
 	void _clear_selection();
 	void _update_group_pivot();
+	Vector2 _get_effective_pivot_local() const;
 	void _box_select_points(const Rect2 &p_screen_rect, bool p_append);
 	void _begin_group_transform(PointTransformGizmo2D::Mode p_mode, PointTransformGizmo2D::HitType p_hit, const Vector2 &p_from_screen);
 	void _update_group_transform(const Vector2 &p_to_screen, bool p_shift);

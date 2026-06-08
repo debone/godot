@@ -51,6 +51,13 @@ bool AbstractPolygon2DEditor::Vertex::operator!=(const AbstractPolygon2DEditor::
 	return !(*this == p_vertex);
 }
 
+bool AbstractPolygon2DEditor::Vertex::operator<(const AbstractPolygon2DEditor::Vertex &p_vertex) const {
+	if (polygon != p_vertex.polygon) {
+		return polygon < p_vertex.polygon;
+	}
+	return vertex < p_vertex.vertex;
+}
+
 bool AbstractPolygon2DEditor::Vertex::valid() const {
 	return vertex >= 0;
 }
@@ -261,6 +268,8 @@ void AbstractPolygon2DEditor::_wip_cancel() {
 	edited_point = PosVertex();
 	hover_point = Vertex();
 	selected_point = Vertex();
+	selected_points.clear();
+	group_pivot_local = Vector2();
 	center_drag = false;
 
 	canvas_item_editor->update_viewport();
@@ -297,6 +306,8 @@ void AbstractPolygon2DEditor::_wip_close() {
 	edited_point = PosVertex();
 	hover_point = Vertex();
 	selected_point = Vertex();
+	selected_points.clear();
+	group_pivot_local = Vector2();
 	center_drag = false;
 }
 
@@ -336,6 +347,289 @@ bool AbstractPolygon2DEditor::_commit_drag() {
 	return true;
 }
 
+PointTransformGizmo2D::Mode AbstractPolygon2DEditor::_get_gizmo_mode() const {
+	switch (CanvasItemEditor::get_singleton()->get_current_tool()) {
+		case CanvasItemEditor::TOOL_MOVE:
+			return PointTransformGizmo2D::Mode::MOVE;
+		case CanvasItemEditor::TOOL_ROTATE:
+			return PointTransformGizmo2D::Mode::ROTATE;
+		case CanvasItemEditor::TOOL_SCALE:
+			return PointTransformGizmo2D::Mode::SCALE;
+		default:
+			return PointTransformGizmo2D::Mode::NONE;
+	}
+}
+
+void AbstractPolygon2DEditor::_clear_selection() {
+	selected_points.clear();
+	selected_point = Vertex();
+	group_pivot_local = Vector2();
+}
+
+void AbstractPolygon2DEditor::_update_group_pivot() {
+	Vector<Vector2> pts;
+	for (const Vertex &v : selected_points) {
+		const Vector<Vector2> poly = _get_polygon(v.polygon);
+		if (v.vertex >= 0 && v.vertex < poly.size()) {
+			pts.push_back(poly[v.vertex] + _get_offset(v.polygon));
+		}
+	}
+	group_pivot_local = PointTransformGizmo2D::selection_center(pts);
+}
+
+void AbstractPolygon2DEditor::_select_point(const Vertex &p_vertex, bool p_append) {
+	if (p_append) {
+		if (selected_points.has(p_vertex)) {
+			selected_points.erase(p_vertex);
+		} else {
+			selected_points.insert(p_vertex);
+		}
+	} else {
+		selected_points.clear();
+		selected_points.insert(p_vertex);
+	}
+
+	selected_point = selected_points.has(p_vertex) ? p_vertex : Vertex();
+	_update_group_pivot();
+}
+
+void AbstractPolygon2DEditor::_box_select_points(const Rect2 &p_screen_rect, bool p_append) {
+	if (!p_append) {
+		selected_points.clear();
+	}
+
+	const Transform2D xform = canvas_item_editor->get_canvas_transform() * _get_node()->get_screen_transform();
+	const int n_polygons = _get_polygon_count();
+	for (int j = 0; j < n_polygons; j++) {
+		const Vector<Vector2> points = _get_polygon(j);
+		const Vector2 offset = _get_offset(j);
+		for (int i = 0; i < points.size(); i++) {
+			const Vector2 screen = xform.xform(points[i] + offset);
+			if (PointTransformGizmo2D::rect_contains_point(p_screen_rect, screen)) {
+				const Vertex vertex(j, i);
+				selected_points.insert(vertex);
+				selected_point = vertex;
+			}
+		}
+	}
+
+	if (!selected_points.has(selected_point)) {
+		selected_point = Vertex();
+	}
+	_update_group_pivot();
+}
+
+void AbstractPolygon2DEditor::_begin_group_transform(PointTransformGizmo2D::Mode p_mode, PointTransformGizmo2D::HitType p_hit, const Vector2 &p_from_screen) {
+	group_drag_active = true;
+	group_mode = p_mode;
+	group_hit = p_hit;
+	group_drag_from_screen = p_from_screen;
+	group_scale_preview = Vector2();
+
+	_update_group_pivot();
+	group_drag_pivot_local = group_pivot_local;
+
+	group_pre_transform.clear();
+	for (const Vertex &v : selected_points) {
+		if (!group_pre_transform.has(v.polygon)) {
+			group_pre_transform.insert(v.polygon, _get_polygon(v.polygon));
+		}
+	}
+
+	// While dragging the whole selection, the legacy single-point preview is unused.
+	edited_point = PosVertex();
+}
+
+void AbstractPolygon2DEditor::_update_group_transform(const Vector2 &p_to_screen, bool p_shift) {
+	if (!group_drag_active) {
+		return;
+	}
+
+	const Transform2D xform = canvas_item_editor->get_canvas_transform() * _get_node()->get_screen_transform();
+	const Transform2D xform_inv = xform.affine_inverse();
+	const Vector2 pivot = group_drag_pivot_local;
+
+	Vector2 translate;
+	real_t rotate = 0.0;
+	Vector2 scale = Vector2(1, 1);
+	group_scale_preview = Vector2();
+
+	switch (group_mode) {
+		case PointTransformGizmo2D::Mode::MOVE: {
+			Vector2 delta = xform_inv.basis_xform(p_to_screen - group_drag_from_screen);
+
+			bool axis_x = group_hit == PointTransformGizmo2D::HitType::AXIS_X;
+			bool axis_y = group_hit == PointTransformGizmo2D::HitType::AXIS_Y;
+			if (p_shift && !axis_x && !axis_y) {
+				if (Math::abs(delta.x) > Math::abs(delta.y)) {
+					axis_x = true;
+				} else {
+					axis_y = true;
+				}
+			}
+			if (axis_x) {
+				delta.y = 0;
+			}
+			if (axis_y) {
+				delta.x = 0;
+			}
+
+			// Snap by snapping the anchor point onto the grid, then move the group by the same delta.
+			if (selected_point.valid() && group_pre_transform.has(selected_point.polygon)) {
+				const Vector<Vector2> &orig_poly = group_pre_transform[selected_point.polygon];
+				if (selected_point.vertex < orig_poly.size()) {
+					const Vector2 anchor_orig = orig_poly[selected_point.vertex] + _get_offset(selected_point.polygon);
+					const Vector2 desired_world = _get_node()->get_screen_transform().xform(anchor_orig + delta);
+					const Vector2 snapped_world = canvas_item_editor->snap_point(desired_world);
+					const Vector2 snapped_local = _get_node()->get_screen_transform().affine_inverse().xform(snapped_world);
+					delta = snapped_local - anchor_orig;
+					if (axis_x) {
+						delta.y = 0;
+					}
+					if (axis_y) {
+						delta.x = 0;
+					}
+				}
+			}
+			translate = delta;
+		} break;
+
+		case PointTransformGizmo2D::Mode::ROTATE: {
+			const Vector2 start_lm = xform_inv.xform(group_drag_from_screen);
+			const Vector2 cur_lm = xform_inv.xform(p_to_screen);
+			rotate = (cur_lm - pivot).angle() - (start_lm - pivot).angle();
+		} break;
+
+		case PointTransformGizmo2D::Mode::SCALE: {
+			const Vector2 start_lm = xform_inv.xform(group_drag_from_screen);
+			const Vector2 cur_lm = xform_inv.xform(p_to_screen);
+			const Vector2 start_off = start_lm - pivot;
+			const Vector2 cur_off = cur_lm - pivot;
+
+			const bool uniform = p_shift;
+			if (!uniform && group_hit == PointTransformGizmo2D::HitType::AXIS_X) {
+				scale.x = Math::is_zero_approx(start_off.x) ? 1.0 : cur_off.x / start_off.x;
+			} else if (!uniform && group_hit == PointTransformGizmo2D::HitType::AXIS_Y) {
+				scale.y = Math::is_zero_approx(start_off.y) ? 1.0 : cur_off.y / start_off.y;
+			} else {
+				const real_t s = Math::is_zero_approx(start_off.length()) ? 1.0 : cur_off.length() / start_off.length();
+				scale = Vector2(s, s);
+			}
+			group_scale_preview = Vector2((scale.x - 1.0) * 25.0, (scale.y - 1.0) * 25.0);
+		} break;
+
+		case PointTransformGizmo2D::Mode::NONE:
+			return;
+	}
+
+	// Apply the transform to every selected point, writing live to each affected polygon.
+	for (const KeyValue<int, Vector<Vector2>> &kv : group_pre_transform) {
+		const int poly_idx = kv.key;
+		const Vector2 offset = _get_offset(poly_idx);
+		Vector<Vector2> verts = kv.value;
+		for (const Vertex &v : selected_points) {
+			if (v.polygon != poly_idx || v.vertex >= verts.size()) {
+				continue;
+			}
+			const Vector2 orig = kv.value[v.vertex] + offset;
+			const Vector2 np = PointTransformGizmo2D::apply_transform(orig, pivot, group_mode, translate, rotate, scale);
+			verts.write[v.vertex] = np - offset;
+		}
+		_set_polygon(poly_idx, verts);
+	}
+
+	canvas_item_editor->update_viewport();
+}
+
+void AbstractPolygon2DEditor::_commit_group_transform() {
+	group_drag_active = false;
+	group_scale_preview = Vector2();
+
+	Vector<int> changed;
+	for (const KeyValue<int, Vector<Vector2>> &kv : group_pre_transform) {
+		const Vector<Vector2> current = _get_polygon(kv.key);
+		if (current != kv.value) {
+			changed.push_back(kv.key);
+		}
+	}
+
+	if (!changed.is_empty()) {
+		EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+		String action_name;
+		switch (group_mode) {
+			case PointTransformGizmo2D::Mode::ROTATE:
+				action_name = TTR("Rotate Points");
+				break;
+			case PointTransformGizmo2D::Mode::SCALE:
+				action_name = TTR("Scale Points");
+				break;
+			default:
+				action_name = TTR("Move Points");
+				break;
+		}
+		undo_redo->create_action(action_name);
+		for (int idx : changed) {
+			_action_set_polygon(idx, group_pre_transform[idx], _get_polygon(idx));
+		}
+		_commit_action();
+	}
+
+	group_pre_transform.clear();
+	_update_group_pivot();
+}
+
+void AbstractPolygon2DEditor::_cancel_group_transform() {
+	if (!group_drag_active) {
+		return;
+	}
+	group_drag_active = false;
+	group_scale_preview = Vector2();
+	for (const KeyValue<int, Vector<Vector2>> &kv : group_pre_transform) {
+		_set_polygon(kv.key, kv.value);
+	}
+	group_pre_transform.clear();
+	_update_group_pivot();
+	canvas_item_editor->update_viewport();
+}
+
+void AbstractPolygon2DEditor::remove_points(const Vector<Vertex> &p_vertices) {
+	if (p_vertices.is_empty()) {
+		return;
+	}
+
+	HashMap<int, Vector<int>> by_poly;
+	for (const Vertex &v : p_vertices) {
+		by_poly[v.polygon].push_back(v.vertex);
+	}
+
+	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+	undo_redo->create_action(TTR("Edit Polygon (Remove Points)"));
+	const int min_points = _is_line() ? 2 : 3;
+	for (KeyValue<int, Vector<int>> &kv : by_poly) {
+		Vector<int> idxs = kv.value;
+		idxs.sort();
+		Vector<Vector2> verts = _get_polygon(kv.key);
+		// Remove from the back so earlier indices stay valid.
+		for (int i = idxs.size() - 1; i >= 0; i--) {
+			if (idxs[i] >= 0 && idxs[i] < verts.size()) {
+				verts.remove_at(idxs[i]);
+			}
+		}
+		if (verts.size() >= min_points) {
+			_action_set_polygon(kv.key, _get_polygon(kv.key), verts);
+		} else {
+			_action_remove_polygon(kv.key);
+		}
+	}
+	_commit_action();
+
+	_clear_selection();
+	hover_point = Vertex();
+	if (_is_empty()) {
+		_menu_option(MODE_CREATE);
+	}
+}
+
 bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 	if (!_get_node() || !_polygon_editing_enabled) {
 		return false;
@@ -361,8 +655,11 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 		return (mb.is_valid() && mb->get_button_index() == MouseButton::LEFT);
 	}
 
-	CanvasItemEditor::Tool tool = CanvasItemEditor::get_singleton()->get_current_tool();
-	if (tool != CanvasItemEditor::TOOL_SELECT) {
+	const CanvasItemEditor::Tool tool = CanvasItemEditor::get_singleton()->get_current_tool();
+	const PointTransformGizmo2D::Mode gizmo_mode = _get_gizmo_mode();
+
+	// Only participate for the selection and transform tools.
+	if (tool != CanvasItemEditor::TOOL_SELECT && gizmo_mode == PointTransformGizmo2D::Mode::NONE) {
 		return false;
 	}
 
@@ -373,24 +670,98 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 		Vector2 cpoint = canvas_item_editor->snap_point(canvas_item_editor->get_canvas_transform().affine_inverse().xform(gpoint));
 		cpoint = _get_node()->get_screen_transform().affine_inverse().xform(cpoint);
 
+		// Finish an in-progress group transform.
+		if (group_drag_active) {
+			if (mb->get_button_index() == MouseButton::LEFT && !mb->is_pressed()) {
+				_commit_group_transform();
+				return true;
+			}
+			if (mb->get_button_index() == MouseButton::RIGHT && mb->is_pressed()) {
+				_cancel_group_transform();
+				return true;
+			}
+		}
+
+		// Finish an in-progress box selection.
+		if (box_selecting) {
+			if (mb->get_button_index() == MouseButton::LEFT && !mb->is_pressed()) {
+				Rect2 rect;
+				rect.position = box_from_screen;
+				rect.expand_to(box_to_screen);
+				_box_select_points(rect, box_append);
+				box_selecting = false;
+				canvas_item_editor->update_viewport();
+				return true;
+			}
+			if (mb->get_button_index() == MouseButton::RIGHT && mb->is_pressed()) {
+				box_selecting = false;
+				canvas_item_editor->update_viewport();
+				return true;
+			}
+		}
+
+		// Start a group transform by grabbing a gizmo handle (shift is reserved for selection).
+		if (gizmo_mode != PointTransformGizmo2D::Mode::NONE && !selected_points.is_empty() &&
+				mb->get_button_index() == MouseButton::LEFT && mb->is_pressed() && !mb->is_shift_pressed()) {
+			const Vector2 pivot_screen = xform.xform(group_pivot_local);
+			const real_t basis_rot = canvas_item_editor->is_using_local_space() ? xform.get_rotation() : 0.0;
+			const PointTransformGizmo2D::HitType hit = PointTransformGizmo2D::hit_test(gizmo_mode, pivot_screen, basis_rot, gpoint);
+			if (hit != PointTransformGizmo2D::HitType::NONE) {
+				_begin_group_transform(gizmo_mode, hit, gpoint);
+				return true;
+			}
+		}
+
 		if (mode == MODE_EDIT || (_is_line() && mode == MODE_CREATE)) {
 			if (mb->get_button_index() == MouseButton::LEFT) {
 				if (mb->is_pressed()) {
-					if (mb->is_meta_pressed() || mb->is_ctrl_pressed() || mb->is_shift_pressed() || mb->is_alt_pressed()) {
+					if (mb->is_meta_pressed() || mb->is_ctrl_pressed() || mb->is_alt_pressed()) {
 						return false;
 					}
 
 					const PosVertex closest = closest_point(gpoint);
 					if (closest.valid()) {
 						original_mouse_pos = gpoint;
+
+						if (mb->is_shift_pressed()) {
+							// Toggle this point in the multi-selection.
+							_select_point(closest, true);
+							canvas_item_editor->update_viewport();
+							return true;
+						}
+
+						if (selected_points.has(closest) && selected_points.size() > 1) {
+							// Grabbing a point that is part of a multi-selection drags the whole group.
+							selected_point = closest;
+							_begin_group_transform(PointTransformGizmo2D::Mode::MOVE, PointTransformGizmo2D::HitType::PLANE, gpoint);
+							return true;
+						}
+
+						// Select just this point and start a single-point move (legacy path).
+						_select_point(closest, false);
 						pre_move_edit = _get_polygon(closest.polygon);
 						edited_point = PosVertex(closest, xform.affine_inverse().xform(closest.pos));
-						selected_point = closest;
 						edge_point = PosVertex();
 						canvas_item_editor->update_viewport();
 						return true;
+					} else if (mb->is_shift_pressed()) {
+						if (mode != MODE_EDIT || gizmo_mode != PointTransformGizmo2D::Mode::NONE) {
+							return false;
+						}
+						// Shift on empty space: begin an additive box selection.
+						box_selecting = true;
+						box_append = true;
+						box_from_screen = gpoint;
+						box_to_screen = gpoint;
+						return true;
 					} else {
-						selected_point = Vertex();
+						_clear_selection();
+
+						// In a transform tool, cede empty space to the canvas editor (node move/box).
+						if (gizmo_mode != PointTransformGizmo2D::Mode::NONE) {
+							canvas_item_editor->update_viewport();
+							return false;
+						}
 
 						const PosVertex insert = closest_edge_point(gpoint);
 						if (insert.valid()) {
@@ -416,6 +787,15 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 								return true;
 							}
 						}
+
+						// Empty space with no edge to split: begin a box selection.
+						if (mode == MODE_EDIT) {
+							box_selecting = true;
+							box_append = false;
+							box_from_screen = gpoint;
+							box_to_screen = gpoint;
+							return true;
+						}
 					}
 				} else {
 					if (edited_point.valid()) {
@@ -430,6 +810,7 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 						}
 
 						edited_point = PosVertex();
+						_update_group_pivot();
 						return true;
 					}
 				}
@@ -530,7 +911,14 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 	if (mm.is_valid()) {
 		Vector2 gpoint = mm->get_position();
 
-		if (center_drag) {
+		if (group_drag_active) {
+			_update_group_transform(gpoint, mm->is_shift_pressed());
+			return true;
+		} else if (box_selecting) {
+			box_to_screen = gpoint;
+			canvas_item_editor->update_viewport();
+			return true;
+		} else if (center_drag) {
 			Vector2 cpoint = canvas_item_editor->snap_point(canvas_item_editor->get_canvas_transform().affine_inverse().xform(gpoint));
 			cpoint = _get_node()->get_screen_transform().affine_inverse().xform(cpoint);
 			Vector2 delta = center_drag_origin - cpoint;
@@ -610,6 +998,13 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 					canvas_item_editor->update_viewport();
 					return true;
 				}
+			} else if (!selected_points.is_empty()) {
+				Vector<Vertex> to_remove;
+				for (const Vertex &v : selected_points) {
+					to_remove.push_back(v);
+				}
+				remove_points(to_remove);
+				return true;
 			} else {
 				const Vertex active_point = get_active_point();
 
@@ -738,7 +1133,8 @@ void AbstractPolygon2DEditor::forward_canvas_draw_over_viewport(Control *p_overl
 			const Vector2 p = (vertex == edited_point) ? edited_point.pos : (points[i] + offset);
 			const Vector2 point = xform.xform(p);
 
-			const Color overlay_modulate = vertex == active_point ? Color(0.4, 1, 1) : Color(1, 1, 1);
+			const bool is_selected = selected_points.has(vertex) || vertex == active_point;
+			const Color overlay_modulate = is_selected ? Color(0.4, 1, 1) : Color(1, 1, 1);
 			p_overlay->draw_texture(handle, point - handle->get_size() * 0.5, overlay_modulate);
 
 			if (vertex == hover_point) {
@@ -753,6 +1149,27 @@ void AbstractPolygon2DEditor::forward_canvas_draw_over_viewport(Control *p_overl
 	if (edge_point.valid()) {
 		Ref<Texture2D> add_handle = get_editor_theme_icon(SNAME("EditorHandleAdd"));
 		p_overlay->draw_texture(add_handle, edge_point.pos - add_handle->get_size() * 0.5);
+	}
+
+	// Draw the transform gizmo for the current selection.
+	const PointTransformGizmo2D::Mode gizmo_mode = _get_gizmo_mode();
+	if (gizmo_mode != PointTransformGizmo2D::Mode::NONE && !selected_points.is_empty()) {
+		const Vector2 pivot_local = group_drag_active ? group_drag_pivot_local : group_pivot_local;
+		const Vector2 pivot_screen = xform.xform(pivot_local);
+		const real_t basis_rot = canvas_item_editor->is_using_local_space() ? xform.get_rotation() : 0.0;
+		const PointTransformGizmo2D::HitType active_hit = group_drag_active ? group_hit : PointTransformGizmo2D::HitType::NONE;
+		PointTransformGizmo2D::draw_gizmo(p_overlay, gizmo_mode, pivot_screen, basis_rot, active_hit, group_drag_active ? group_scale_preview : Vector2());
+	}
+
+	// Draw the box (rubber-band) selection rectangle.
+	if (box_selecting) {
+		const Color fill = get_theme_color(SNAME("box_selection_fill_color"), EditorStringName(Editor));
+		const Color stroke = get_theme_color(SNAME("box_selection_stroke_color"), EditorStringName(Editor));
+		Rect2 rect;
+		rect.position = box_from_screen;
+		rect.expand_to(box_to_screen);
+		p_overlay->draw_rect(rect, fill);
+		p_overlay->draw_rect(rect, stroke, false, Math::round(EDSCALE));
 	}
 }
 
@@ -783,6 +1200,10 @@ void AbstractPolygon2DEditor::edit(Node *p_polygon) {
 		edited_point = PosVertex();
 		hover_point = Vertex();
 		selected_point = Vertex();
+		selected_points.clear();
+		group_pivot_local = Vector2();
+		group_drag_active = false;
+		box_selecting = false;
 		center_drag = false;
 	} else {
 		_set_node(nullptr);
@@ -812,9 +1233,11 @@ void AbstractPolygon2DEditor::remove_point(const Vertex &p_vertex) {
 	}
 
 	hover_point = Vertex();
+	selected_points.erase(p_vertex);
 	if (selected_point == p_vertex) {
 		selected_point = Vertex();
 	}
+	_update_group_pivot();
 }
 
 AbstractPolygon2DEditor::Vertex AbstractPolygon2DEditor::get_active_point() const {

@@ -30,7 +30,10 @@
 
 #pragma once
 
+#include "core/templates/hash_map.h"
+#include "core/templates/rb_set.h"
 #include "editor/plugins/editor_plugin.h"
+#include "editor/scene/2d/point_transform_gizmo_2d.h"
 #include "scene/2d/node_2d.h"
 #include "scene/gui/box_container.h"
 
@@ -56,6 +59,7 @@ class AbstractPolygon2DEditor : public HBoxContainer {
 
 		bool operator==(const Vertex &p_vertex) const;
 		bool operator!=(const Vertex &p_vertex) const;
+		bool operator<(const Vertex &p_vertex) const; // Ordering so Vertex can key an RBSet.
 
 		bool valid() const;
 
@@ -77,9 +81,27 @@ class AbstractPolygon2DEditor : public HBoxContainer {
 
 	PosVertex edited_point;
 	Vertex hover_point; // point under mouse cursor
-	Vertex selected_point; // currently selected
+	Vertex selected_point; // anchor of the current selection (last clicked)
 	PosVertex edge_point; // adding an edge point?
 	Vector2 original_mouse_pos;
+
+	RBSet<Vertex> selected_points; // multi-point selection
+	Vector2 group_pivot_local; // geometric center of the selection, in node-local space
+
+	// Group transform (move/rotate/scale of the whole selection) drag state.
+	PointTransformGizmo2D::Mode group_mode = PointTransformGizmo2D::Mode::NONE;
+	PointTransformGizmo2D::HitType group_hit = PointTransformGizmo2D::HitType::NONE;
+	bool group_drag_active = false;
+	Vector2 group_drag_from_screen;
+	Vector2 group_drag_pivot_local;
+	Vector2 group_scale_preview; // pixel offset for the scale gizmo handles while dragging
+	HashMap<int, Vector<Vector2>> group_pre_transform; // polygon index -> points before the drag
+
+	// Box (rubber-band) selection state.
+	bool box_selecting = false;
+	bool box_append = false;
+	Vector2 box_from_screen;
+	Vector2 box_to_screen;
 
 	Vector<Vector2> pre_move_edit;
 	Vector<Vector2> wip;
@@ -119,9 +141,21 @@ protected:
 	bool _commit_drag();
 
 	void remove_point(const Vertex &p_vertex);
+	void remove_points(const Vector<Vertex> &p_vertices);
 	Vertex get_active_point() const;
 	PosVertex closest_point(const Vector2 &p_pos) const;
 	PosVertex closest_edge_point(const Vector2 &p_pos) const;
+
+	// Multi-point selection / group transform helpers.
+	PointTransformGizmo2D::Mode _get_gizmo_mode() const;
+	void _select_point(const Vertex &p_vertex, bool p_append);
+	void _clear_selection();
+	void _update_group_pivot();
+	void _box_select_points(const Rect2 &p_screen_rect, bool p_append);
+	void _begin_group_transform(PointTransformGizmo2D::Mode p_mode, PointTransformGizmo2D::HitType p_hit, const Vector2 &p_from_screen);
+	void _update_group_transform(const Vector2 &p_to_screen, bool p_shift);
+	void _commit_group_transform();
+	void _cancel_group_transform();
 
 	bool _is_empty() const;
 

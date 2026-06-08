@@ -30,7 +30,10 @@
 
 #pragma once
 
+#include "core/templates/hash_map.h"
+#include "core/templates/rb_set.h"
 #include "editor/plugins/editor_plugin.h"
+#include "editor/scene/2d/point_transform_gizmo_2d.h"
 #include "scene/2d/path_2d.h"
 #include "scene/gui/box_container.h"
 
@@ -99,6 +102,40 @@ class Path2DEditor : public HBoxContainer {
 	// Number of control points in range of the last click.
 	// 0, 1, or 2.
 	int control_points_in_range = 0;
+
+	// Multi-point selection (point indices) and group transform via Move/Rotate/Scale gizmos.
+	RBSet<int> selected_points;
+	Vector2 group_pivot_local;
+
+	struct CurvePointState {
+		Vector2 pos;
+		Vector2 in;
+		Vector2 out;
+	};
+
+	PointTransformGizmo2D::Mode group_mode = PointTransformGizmo2D::Mode::NONE;
+	PointTransformGizmo2D::HitType group_hit = PointTransformGizmo2D::HitType::NONE;
+	bool group_drag_active = false;
+	Vector2 group_drag_from_screen;
+	Vector2 group_drag_pivot_local;
+	Vector2 group_scale_preview;
+	HashMap<int, CurvePointState> group_pre_transform;
+
+	bool box_selecting = false;
+	bool box_append = false;
+	Vector2 box_from_screen;
+	Vector2 box_to_screen;
+
+	PointTransformGizmo2D::Mode _get_gizmo_mode() const;
+	void _select_point(int p_idx, bool p_append);
+	void _clear_selection();
+	void _update_group_pivot();
+	void _box_select_points(const Rect2 &p_screen_rect, bool p_append);
+	void _begin_group_transform(PointTransformGizmo2D::Mode p_mode, PointTransformGizmo2D::HitType p_hit, const Vector2 &p_from_screen);
+	void _update_group_transform(const Vector2 &p_to_screen);
+	void _commit_group_transform();
+	void _cancel_group_transform();
+	void _delete_selected_points();
 
 	void _mode_selected(int p_mode);
 	void _handle_option_pressed(int p_option);

@@ -34,9 +34,11 @@
 #include "core/object/class_db.h"
 #include "core/os/keyboard.h"
 #include "editor/editor_node.h"
+#include "editor/editor_string_names.h"
 #include "editor/editor_undo_redo_manager.h"
 #include "editor/scene/canvas_item_editor_plugin.h"
 #include "editor/settings/editor_settings.h"
+#include "editor/themes/editor_scale.h"
 #include "scene/gui/dialogs.h"
 #include "scene/gui/menu_button.h"
 #include "scene/resources/mesh.h"
@@ -62,6 +64,262 @@ void Path2DEditor::_node_removed(Node *p_node) {
 		node = nullptr;
 		hide();
 	}
+}
+
+PointTransformGizmo2D::Mode Path2DEditor::_get_gizmo_mode() const {
+	switch (CanvasItemEditor::get_singleton()->get_current_tool()) {
+		case CanvasItemEditor::TOOL_MOVE:
+			return PointTransformGizmo2D::Mode::MOVE;
+		case CanvasItemEditor::TOOL_ROTATE:
+			return PointTransformGizmo2D::Mode::ROTATE;
+		case CanvasItemEditor::TOOL_SCALE:
+			return PointTransformGizmo2D::Mode::SCALE;
+		default:
+			return PointTransformGizmo2D::Mode::NONE;
+	}
+}
+
+void Path2DEditor::_clear_selection() {
+	selected_points.clear();
+	group_pivot_local = Vector2();
+}
+
+void Path2DEditor::_update_group_pivot() {
+	Ref<Curve2D> curve = node ? node->get_curve() : Ref<Curve2D>();
+	Vector<Vector2> pts;
+	if (curve.is_valid()) {
+		for (const int &idx : selected_points) {
+			if (idx >= 0 && idx < curve->get_point_count()) {
+				pts.push_back(curve->get_point_position(idx));
+			}
+		}
+	}
+	group_pivot_local = PointTransformGizmo2D::selection_center(pts);
+}
+
+void Path2DEditor::_select_point(int p_idx, bool p_append) {
+	if (p_append) {
+		if (selected_points.has(p_idx)) {
+			selected_points.erase(p_idx);
+		} else {
+			selected_points.insert(p_idx);
+		}
+	} else {
+		selected_points.clear();
+		selected_points.insert(p_idx);
+	}
+	_update_group_pivot();
+}
+
+void Path2DEditor::_box_select_points(const Rect2 &p_screen_rect, bool p_append) {
+	if (!p_append) {
+		selected_points.clear();
+	}
+	Ref<Curve2D> curve = node->get_curve();
+	if (curve.is_null()) {
+		return;
+	}
+	const Transform2D xform = canvas_item_editor->get_canvas_transform() * node->get_screen_transform();
+	for (int i = 0; i < curve->get_point_count(); i++) {
+		const Vector2 screen = xform.xform(curve->get_point_position(i));
+		if (PointTransformGizmo2D::rect_contains_point(p_screen_rect, screen)) {
+			selected_points.insert(i);
+		}
+	}
+	_update_group_pivot();
+}
+
+void Path2DEditor::_begin_group_transform(PointTransformGizmo2D::Mode p_mode, PointTransformGizmo2D::HitType p_hit, const Vector2 &p_from_screen) {
+	group_drag_active = true;
+	group_mode = p_mode;
+	group_hit = p_hit;
+	group_drag_from_screen = p_from_screen;
+	group_scale_preview = Vector2();
+
+	_update_group_pivot();
+	group_drag_pivot_local = group_pivot_local;
+
+	group_pre_transform.clear();
+	Ref<Curve2D> curve = node->get_curve();
+	for (const int &idx : selected_points) {
+		if (idx >= 0 && idx < curve->get_point_count()) {
+			CurvePointState st;
+			st.pos = curve->get_point_position(idx);
+			st.in = curve->get_point_in(idx);
+			st.out = curve->get_point_out(idx);
+			group_pre_transform.insert(idx, st);
+		}
+	}
+}
+
+void Path2DEditor::_update_group_transform(const Vector2 &p_to_screen) {
+	if (!group_drag_active) {
+		return;
+	}
+	Ref<Curve2D> curve = node->get_curve();
+	if (curve.is_null()) {
+		return;
+	}
+
+	const Transform2D xform = canvas_item_editor->get_canvas_transform() * node->get_screen_transform();
+	const Transform2D xform_inv = xform.affine_inverse();
+	const Vector2 pivot = group_drag_pivot_local;
+
+	Vector2 translate;
+	real_t rotate = 0.0;
+	Vector2 scale = Vector2(1, 1);
+	group_scale_preview = Vector2();
+
+	switch (group_mode) {
+		case PointTransformGizmo2D::Mode::MOVE: {
+			Vector2 delta = xform_inv.basis_xform(p_to_screen - group_drag_from_screen);
+			if (group_hit == PointTransformGizmo2D::HitType::AXIS_X) {
+				delta.y = 0;
+			} else if (group_hit == PointTransformGizmo2D::HitType::AXIS_Y) {
+				delta.x = 0;
+			}
+			translate = delta;
+		} break;
+
+		case PointTransformGizmo2D::Mode::ROTATE: {
+			const Vector2 start_lm = xform_inv.xform(group_drag_from_screen);
+			const Vector2 cur_lm = xform_inv.xform(p_to_screen);
+			rotate = (cur_lm - pivot).angle() - (start_lm - pivot).angle();
+		} break;
+
+		case PointTransformGizmo2D::Mode::SCALE: {
+			const Vector2 start_off = xform_inv.xform(group_drag_from_screen) - pivot;
+			const Vector2 cur_off = xform_inv.xform(p_to_screen) - pivot;
+			if (group_hit == PointTransformGizmo2D::HitType::AXIS_X) {
+				scale.x = Math::is_zero_approx(start_off.x) ? 1.0 : cur_off.x / start_off.x;
+			} else if (group_hit == PointTransformGizmo2D::HitType::AXIS_Y) {
+				scale.y = Math::is_zero_approx(start_off.y) ? 1.0 : cur_off.y / start_off.y;
+			} else {
+				const real_t s = Math::is_zero_approx(start_off.length()) ? 1.0 : cur_off.length() / start_off.length();
+				scale = Vector2(s, s);
+			}
+			group_scale_preview = Vector2((scale.x - 1.0) * 25.0, (scale.y - 1.0) * 25.0);
+		} break;
+
+		case PointTransformGizmo2D::Mode::NONE:
+			return;
+	}
+
+	// Apply to each selected point, transforming its in/out handles along with it.
+	for (const KeyValue<int, CurvePointState> &kv : group_pre_transform) {
+		const int idx = kv.key;
+		if (idx >= curve->get_point_count()) {
+			continue;
+		}
+		const CurvePointState &st = kv.value;
+		const Vector2 new_pos = PointTransformGizmo2D::apply_transform(st.pos, pivot, group_mode, translate, rotate, scale);
+		curve->set_point_position(idx, new_pos);
+		if (group_mode == PointTransformGizmo2D::Mode::ROTATE) {
+			curve->set_point_in(idx, st.in.rotated(rotate));
+			curve->set_point_out(idx, st.out.rotated(rotate));
+		} else if (group_mode == PointTransformGizmo2D::Mode::SCALE) {
+			curve->set_point_in(idx, st.in * scale);
+			curve->set_point_out(idx, st.out * scale);
+		}
+	}
+
+	canvas_item_editor->update_viewport();
+}
+
+void Path2DEditor::_commit_group_transform() {
+	group_drag_active = false;
+	group_scale_preview = Vector2();
+
+	Ref<Curve2D> curve = node->get_curve();
+	if (curve.is_null() || group_pre_transform.is_empty()) {
+		group_pre_transform.clear();
+		return;
+	}
+
+	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+	String action_name;
+	switch (group_mode) {
+		case PointTransformGizmo2D::Mode::ROTATE:
+			action_name = TTR("Rotate Curve Points");
+			break;
+		case PointTransformGizmo2D::Mode::SCALE:
+			action_name = TTR("Scale Curve Points");
+			break;
+		default:
+			action_name = TTR("Move Curve Points");
+			break;
+	}
+
+	undo_redo->create_action(action_name);
+	for (const KeyValue<int, CurvePointState> &kv : group_pre_transform) {
+		const int idx = kv.key;
+		if (idx >= curve->get_point_count()) {
+			continue;
+		}
+		undo_redo->add_do_method(curve.ptr(), "set_point_position", idx, curve->get_point_position(idx));
+		undo_redo->add_do_method(curve.ptr(), "set_point_in", idx, curve->get_point_in(idx));
+		undo_redo->add_do_method(curve.ptr(), "set_point_out", idx, curve->get_point_out(idx));
+		undo_redo->add_undo_method(curve.ptr(), "set_point_position", idx, kv.value.pos);
+		undo_redo->add_undo_method(curve.ptr(), "set_point_in", idx, kv.value.in);
+		undo_redo->add_undo_method(curve.ptr(), "set_point_out", idx, kv.value.out);
+	}
+	undo_redo->add_do_method(canvas_item_editor, "update_viewport");
+	undo_redo->add_undo_method(canvas_item_editor, "update_viewport");
+	undo_redo->commit_action(false);
+
+	group_pre_transform.clear();
+	_update_group_pivot();
+}
+
+void Path2DEditor::_cancel_group_transform() {
+	if (!group_drag_active) {
+		return;
+	}
+	group_drag_active = false;
+	group_scale_preview = Vector2();
+	Ref<Curve2D> curve = node->get_curve();
+	if (curve.is_valid()) {
+		for (const KeyValue<int, CurvePointState> &kv : group_pre_transform) {
+			if (kv.key < curve->get_point_count()) {
+				curve->set_point_position(kv.key, kv.value.pos);
+				curve->set_point_in(kv.key, kv.value.in);
+				curve->set_point_out(kv.key, kv.value.out);
+			}
+		}
+	}
+	group_pre_transform.clear();
+	_update_group_pivot();
+	canvas_item_editor->update_viewport();
+}
+
+void Path2DEditor::_delete_selected_points() {
+	Ref<Curve2D> curve = node->get_curve();
+	if (curve.is_null() || selected_points.is_empty()) {
+		return;
+	}
+
+	// Remove in descending index order so earlier indices stay valid.
+	Vector<int> idxs;
+	for (const int &idx : selected_points) {
+		idxs.push_back(idx);
+	}
+	idxs.sort();
+
+	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+	undo_redo->create_action(TTR("Remove Points from Curve"));
+	for (int i = idxs.size() - 1; i >= 0; i--) {
+		const int idx = idxs[i];
+		if (idx < 0 || idx >= curve->get_point_count()) {
+			continue;
+		}
+		undo_redo->add_do_method(curve.ptr(), "remove_point", idx);
+		undo_redo->add_undo_method(curve.ptr(), "add_point", curve->get_point_position(idx), curve->get_point_in(idx), curve->get_point_out(idx), idx);
+	}
+	undo_redo->add_do_method(canvas_item_editor, "update_viewport");
+	undo_redo->add_undo_method(canvas_item_editor, "update_viewport");
+	undo_redo->commit_action();
+
+	_clear_selection();
 }
 
 bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
@@ -92,6 +350,50 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 		Vector2 cpoint = canvas_item_editor->snap_point(canvas_item_editor->get_canvas_transform().affine_inverse().xform(gpoint));
 		cpoint = node->to_local(node->get_viewport()->get_popup_base_transform().affine_inverse().xform(cpoint));
 
+		const PointTransformGizmo2D::Mode gizmo_mode = _get_gizmo_mode();
+
+		// Finish an in-progress group transform.
+		if (group_drag_active) {
+			if (mb->get_button_index() == MouseButton::LEFT && !mb->is_pressed()) {
+				_commit_group_transform();
+				return true;
+			}
+			if (mb->get_button_index() == MouseButton::RIGHT && mb->is_pressed()) {
+				_cancel_group_transform();
+				return true;
+			}
+		}
+
+		// Finish an in-progress box selection.
+		if (box_selecting) {
+			if (mb->get_button_index() == MouseButton::LEFT && !mb->is_pressed()) {
+				Rect2 rect;
+				rect.position = box_from_screen;
+				rect.expand_to(box_to_screen);
+				_box_select_points(rect, box_append);
+				box_selecting = false;
+				canvas_item_editor->update_viewport();
+				return true;
+			}
+			if (mb->get_button_index() == MouseButton::RIGHT && mb->is_pressed()) {
+				box_selecting = false;
+				canvas_item_editor->update_viewport();
+				return true;
+			}
+		}
+
+		// Start a group transform by grabbing a gizmo handle (shift is reserved for handle editing).
+		if (gizmo_mode != PointTransformGizmo2D::Mode::NONE && !selected_points.is_empty() &&
+				mb->get_button_index() == MouseButton::LEFT && mb->is_pressed() && !mb->is_shift_pressed() && action == ACTION_NONE) {
+			const Vector2 pivot_screen = xform.xform(group_pivot_local);
+			const real_t basis_rot = canvas_item_editor->is_using_local_space() ? xform.get_rotation() : 0.0;
+			const PointTransformGizmo2D::HitType hit = PointTransformGizmo2D::hit_test(gizmo_mode, pivot_screen, basis_rot, gpoint);
+			if (hit != PointTransformGizmo2D::HitType::NONE) {
+				_begin_group_transform(gizmo_mode, hit, gpoint);
+				return true;
+			}
+		}
+
 		if (mb->is_pressed() && action == ACTION_NONE) {
 			Ref<Curve2D> curve = node->get_curve();
 
@@ -107,6 +409,13 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 					if (mode == MODE_EDIT && !mb->is_shift_pressed() && dist_to_p < grab_threshold) {
 						// Points can only be moved in edit mode.
 
+						// Grabbing a point that is part of a multi-selection drags the whole group.
+						if (selected_points.has(i) && selected_points.size() > 1) {
+							_begin_group_transform(PointTransformGizmo2D::Mode::MOVE, PointTransformGizmo2D::HitType::PLANE, gpoint);
+							return true;
+						}
+
+						_select_point(i, false);
 						action = ACTION_MOVING_POINT;
 						action_point = i;
 						moving_from = curve->get_point_position(i);
@@ -147,6 +456,7 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 						undo_redo->add_do_method(canvas_item_editor, "update_viewport");
 						undo_redo->add_undo_method(canvas_item_editor, "update_viewport");
 						undo_redo->commit_action();
+						_clear_selection();
 						return true;
 					} else if (dist_to_p_out < grab_threshold) {
 						undo_redo->create_action(TTR("Remove Out-Control from Curve"));
@@ -177,6 +487,7 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 		// Check for point creation.
 		if (mb->is_pressed() && mb->get_button_index() == MouseButton::LEFT && ((mb->is_command_or_control_pressed() && mode == MODE_EDIT) || mode == MODE_CREATE)) {
 			Ref<Curve2D> curve = node->get_curve();
+			_clear_selection();
 			curve->add_point(cpoint);
 			moving_from = cpoint;
 
@@ -209,6 +520,7 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 			}
 
 			const Vector2 new_point = xform.affine_inverse().xform(gpoint2);
+			_clear_selection();
 			curve->add_point(new_point, Vector2(0, 0), Vector2(0, 0), insertion_point + 1);
 
 			action = ACTION_MOVING_NEW_POINT_FROM_SPLIT;
@@ -220,6 +532,20 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 
 			on_edge = false;
 
+			return true;
+		}
+
+		// Empty-space press in edit mode: begin a box selection (or cede to the canvas in a transform tool).
+		if (mb->is_pressed() && mb->get_button_index() == MouseButton::LEFT && mode == MODE_EDIT && !on_edge && action == ACTION_NONE) {
+			if (gizmo_mode != PointTransformGizmo2D::Mode::NONE) {
+				_clear_selection();
+				canvas_item_editor->update_viewport();
+				return false;
+			}
+			box_selecting = true;
+			box_append = mb->is_shift_pressed();
+			box_from_screen = gpoint;
+			box_to_screen = gpoint;
 			return true;
 		}
 
@@ -298,6 +624,7 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 			}
 
 			action = ACTION_NONE;
+			_update_group_pivot();
 
 			return true;
 		}
@@ -306,6 +633,16 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 	Ref<InputEventMouseMotion> mm = p_event;
 
 	if (mm.is_valid()) {
+		if (group_drag_active) {
+			_update_group_transform(mm->get_position());
+			return true;
+		}
+		if (box_selecting) {
+			box_to_screen = mm->get_position();
+			canvas_item_editor->update_viewport();
+			return true;
+		}
+
 		// When both control points were in range of click,
 		// pick the point that drags the curve outwards.
 		if (control_points_in_range == 2) {
@@ -414,6 +751,14 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 			}
 
 			canvas_item_editor->update_viewport();
+			return true;
+		}
+	}
+
+	Ref<InputEventKey> k = p_event;
+	if (k.is_valid() && k->is_pressed() && !k->is_echo()) {
+		if ((k->get_keycode() == Key::KEY_DELETE || k->get_keycode() == Key::BACKSPACE) && !selected_points.is_empty()) {
+			_delete_selected_points();
 			return true;
 		}
 	}
@@ -611,6 +956,35 @@ void Path2DEditor::forward_canvas_draw_over_viewport(Control *p_overlay) {
 
 		rs->canvas_item_add_multimesh(vpc->get_canvas_item(), debug_handle_smooth_multimesh_rid, curve_handle->get_rid());
 	}
+
+	// Highlight selected points.
+	for (const int &idx : selected_points) {
+		if (idx >= 0 && idx < curve->get_point_count()) {
+			const Vector2 p = xform.xform(curve->get_point_position(idx));
+			p_overlay->draw_texture(path_sharp_handle, p - handle_size * 0.5, Color(0.4, 1, 1));
+		}
+	}
+
+	// Draw the transform gizmo for the current selection.
+	const PointTransformGizmo2D::Mode gizmo_mode = _get_gizmo_mode();
+	if (gizmo_mode != PointTransformGizmo2D::Mode::NONE && !selected_points.is_empty()) {
+		const Vector2 pivot_local = group_drag_active ? group_drag_pivot_local : group_pivot_local;
+		const Vector2 pivot_screen = xform.xform(pivot_local);
+		const real_t basis_rot = canvas_item_editor->is_using_local_space() ? xform.get_rotation() : 0.0;
+		const PointTransformGizmo2D::HitType active_hit = group_drag_active ? group_hit : PointTransformGizmo2D::HitType::NONE;
+		PointTransformGizmo2D::draw_gizmo(p_overlay, gizmo_mode, pivot_screen, basis_rot, active_hit, group_drag_active ? group_scale_preview : Vector2());
+	}
+
+	// Draw the box (rubber-band) selection rectangle.
+	if (box_selecting) {
+		const Color fill = get_theme_color(SNAME("box_selection_fill_color"), EditorStringName(Editor));
+		const Color stroke = get_theme_color(SNAME("box_selection_stroke_color"), EditorStringName(Editor));
+		Rect2 rect;
+		rect.position = box_from_screen;
+		rect.expand_to(box_to_screen);
+		p_overlay->draw_rect(rect, fill);
+		p_overlay->draw_rect(rect, stroke, false, Math::round(EDSCALE));
+	}
 }
 
 void Path2DEditor::_node_visibility_changed() {
@@ -639,6 +1013,10 @@ void Path2DEditor::edit(Node *p_path2d) {
 	if (action != ACTION_NONE) {
 		_cancel_current_action();
 	}
+
+	_clear_selection();
+	group_drag_active = false;
+	box_selecting = false;
 
 	if (p_path2d) {
 		node = Object::cast_to<Path2D>(p_path2d);

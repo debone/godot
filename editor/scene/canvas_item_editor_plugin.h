@@ -614,6 +614,7 @@ public:
 
 	Tool get_current_tool() { return tool; }
 	void set_current_tool(Tool p_tool);
+	bool is_using_local_space() const { return use_local_space; }
 
 	bool is_grid_visible() const;
 	Vector2 get_grid_step() const { return grid_step; }

@@ -187,4 +187,26 @@ Vector2 apply_transform(const Vector2 &p_point, const Vector2 &p_pivot, Mode p_m
 	return p_point;
 }
 
+void NumericInput::reset() {
+	active = false;
+	value = 0.0;
+	next_decimal = 0;
+	negate = false;
+	axis = -1;
+}
+
+void NumericInput::add_digit(uint32_t p_digit) {
+	if (next_decimal < 0) {
+		value = value + p_digit * Math::pow(10.0, (double)next_decimal--);
+	} else {
+		value = value * 10 + p_digit;
+	}
+}
+
+void NumericInput::start_decimal() {
+	if (next_decimal == 0) {
+		next_decimal = -1;
+	}
+}
+
 } //namespace PointTransformGizmo2D

@@ -81,4 +81,21 @@ HitType hit_test(Mode p_mode, const Vector2 &p_pivot_screen, real_t p_basis_rota
 // offset from the pivot by p_scale (component-wise).
 Vector2 apply_transform(const Vector2 &p_point, const Vector2 &p_pivot, Mode p_mode, const Vector2 &p_translate, real_t p_rotate, const Vector2 &p_scale);
 
+// Blender-style numeric entry for a transform: accumulates typed digits, an optional
+// decimal point, a sign, and an axis constraint, so a group transform can be given an
+// exact value (e.g. rotate by typing "45", scale by "2", move "10" on X).
+struct NumericInput {
+	bool active = false;
+	double value = 0.0;
+	int next_decimal = 0; // 0 = integer part, negative = fractional digit position
+	bool negate = false;
+	int axis = -1; // -1 = none/uniform, 0 = X, 1 = Y
+
+	void reset();
+	void add_digit(uint32_t p_digit);
+	void start_decimal();
+	bool has_input() const { return value != 0.0 || next_decimal != 0; }
+	double signed_value() const { return negate ? -value : value; }
+};
+
 } //namespace PointTransformGizmo2D

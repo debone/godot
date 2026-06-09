@@ -531,6 +531,12 @@ void AbstractPolygon2DEditor::_update_group_transform(const Vector2 &p_to_screen
 			return;
 	}
 
+	_apply_group_transform(translate, rotate, scale);
+}
+
+void AbstractPolygon2DEditor::_apply_group_transform(const Vector2 &p_translate, real_t p_rotate, const Vector2 &p_scale) {
+	const Vector2 pivot = group_drag_pivot_local;
+
 	// Apply the transform to every selected point, writing live to each affected polygon.
 	for (const KeyValue<int, Vector<Vector2>> &kv : group_pre_transform) {
 		const int poly_idx = kv.key;
@@ -541,7 +547,7 @@ void AbstractPolygon2DEditor::_update_group_transform(const Vector2 &p_to_screen
 				continue;
 			}
 			const Vector2 orig = kv.value[v.vertex] + offset;
-			const Vector2 np = PointTransformGizmo2D::apply_transform(orig, pivot, group_mode, translate, rotate, scale);
+			const Vector2 np = PointTransformGizmo2D::apply_transform(orig, pivot, group_mode, p_translate, p_rotate, p_scale);
 			verts.write[v.vertex] = np - offset;
 		}
 		_set_polygon(poly_idx, verts);
@@ -588,7 +594,7 @@ void AbstractPolygon2DEditor::_commit_group_transform() {
 }
 
 void AbstractPolygon2DEditor::_cancel_group_transform() {
-	if (!group_drag_active) {
+	if (!group_drag_active && !numeric.active) {
 		return;
 	}
 	group_drag_active = false;
@@ -599,6 +605,145 @@ void AbstractPolygon2DEditor::_cancel_group_transform() {
 	group_pre_transform.clear();
 	_update_group_pivot();
 	canvas_item_editor->update_viewport();
+}
+
+bool AbstractPolygon2DEditor::_handle_numeric_key(const Ref<InputEventKey> &p_key) {
+	if (p_key->is_echo()) {
+		return false;
+	}
+
+	const PointTransformGizmo2D::Mode gm = _get_gizmo_mode();
+	if (gm == PointTransformGizmo2D::Mode::NONE || selected_points.is_empty()) {
+		return false;
+	}
+	// Don't interfere with an active mouse drag or other edits.
+	if (group_drag_active || box_selecting || center_drag || edited_point.valid()) {
+		return false;
+	}
+
+	const Key keycode = p_key->get_keycode();
+	const Key physical = p_key->get_physical_keycode();
+	const bool is_digit = (physical >= Key::KEY_0 && physical <= Key::KEY_9) || (keycode >= Key::KP_0 && keycode <= Key::KP_9);
+
+	if (!numeric.active) {
+		// Only a digit, sign or decimal point starts a numeric transform.
+		if (!is_digit && keycode != Key::MINUS && keycode != Key::KP_SUBTRACT && keycode != Key::PERIOD && physical != Key::KP_PERIOD) {
+			return false;
+		}
+		_update_group_pivot();
+		group_mode = gm;
+		group_hit = PointTransformGizmo2D::HitType::PLANE;
+		group_drag_pivot_local = _get_effective_pivot_local();
+		group_pre_transform.clear();
+		for (const Vertex &v : selected_points) {
+			if (!group_pre_transform.has(v.polygon)) {
+				group_pre_transform.insert(v.polygon, _get_polygon(v.polygon));
+			}
+		}
+		numeric.reset();
+		numeric.active = true;
+		edited_point = PosVertex();
+	}
+
+	if (is_digit) {
+		const uint32_t value = (physical >= Key::KEY_0 && physical <= Key::KEY_9) ? uint32_t(physical - Key::KEY_0) : uint32_t(keycode - Key::KP_0);
+		numeric.add_digit(value);
+	} else if (keycode == Key::MINUS || keycode == Key::KP_SUBTRACT) {
+		numeric.negate = !numeric.negate;
+	} else if (keycode == Key::PERIOD || physical == Key::KP_PERIOD) {
+		numeric.start_decimal();
+	} else if (keycode == Key::X) {
+		numeric.axis = (numeric.axis == 0) ? -1 : 0;
+	} else if (keycode == Key::Y) {
+		numeric.axis = (numeric.axis == 1) ? -1 : 1;
+	} else if (keycode == Key::ENTER || keycode == Key::KP_ENTER || keycode == Key::SPACE) {
+		_apply_numeric_transform();
+		numeric.reset();
+		_commit_group_transform();
+		return true;
+	} else if (keycode == Key::ESCAPE) {
+		numeric.reset();
+		_cancel_group_transform();
+		return true;
+	} else if (keycode == Key::BACKSPACE) {
+		const int saved_axis = numeric.axis;
+		numeric.reset();
+		numeric.active = true;
+		numeric.axis = saved_axis;
+	} else {
+		return false;
+	}
+
+	_apply_numeric_transform();
+	canvas_item_editor->update_viewport();
+	return true;
+}
+
+void AbstractPolygon2DEditor::_apply_numeric_transform() {
+	if (!numeric.active) {
+		return;
+	}
+	if (!numeric.has_input()) {
+		// Nothing typed yet: keep the points at their original positions.
+		_apply_group_transform(Vector2(), 0.0, Vector2(1, 1));
+		return;
+	}
+
+	const double val = numeric.signed_value();
+	Vector2 translate;
+	real_t rotate = 0.0;
+	Vector2 scale = Vector2(1, 1);
+
+	switch (group_mode) {
+		case PointTransformGizmo2D::Mode::MOVE:
+			translate = (numeric.axis == 1) ? Vector2(0, val) : Vector2(val, 0);
+			break;
+		case PointTransformGizmo2D::Mode::ROTATE:
+			rotate = Math::deg_to_rad(val);
+			break;
+		case PointTransformGizmo2D::Mode::SCALE:
+			if (numeric.axis == 0) {
+				scale = Vector2(val, 1);
+			} else if (numeric.axis == 1) {
+				scale = Vector2(1, val);
+			} else {
+				scale = Vector2(val, val);
+			}
+			break;
+		default:
+			return;
+	}
+	_apply_group_transform(translate, rotate, scale);
+}
+
+String AbstractPolygon2DEditor::_numeric_display() const {
+	if (!numeric.active) {
+		return String();
+	}
+	String label;
+	switch (group_mode) {
+		case PointTransformGizmo2D::Mode::MOVE:
+			label = TTR("Move");
+			break;
+		case PointTransformGizmo2D::Mode::ROTATE:
+			label = TTR("Rotate");
+			break;
+		case PointTransformGizmo2D::Mode::SCALE:
+			label = TTR("Scale");
+			break;
+		default:
+			break;
+	}
+	if (group_mode != PointTransformGizmo2D::Mode::ROTATE && numeric.axis == 0) {
+		label += " X";
+	} else if (group_mode != PointTransformGizmo2D::Mode::ROTATE && numeric.axis == 1) {
+		label += " Y";
+	}
+	String num = numeric.has_input() ? String::num(numeric.signed_value()) : String("0");
+	if (group_mode == PointTransformGizmo2D::Mode::ROTATE) {
+		num += String::utf8("°");
+	}
+	return label + ": " + num;
 }
 
 void AbstractPolygon2DEditor::remove_points(const Vector<Vertex> &p_vertices) {
@@ -678,6 +823,22 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 		Vector2 gpoint = mb->get_position();
 		Vector2 cpoint = canvas_item_editor->snap_point(canvas_item_editor->get_canvas_transform().affine_inverse().xform(gpoint));
 		cpoint = _get_node()->get_screen_transform().affine_inverse().xform(cpoint);
+
+		// While a numeric transform is being typed, a click confirms it and a right-click cancels.
+		if (numeric.active) {
+			if (mb->is_pressed() && mb->get_button_index() == MouseButton::LEFT) {
+				_apply_numeric_transform();
+				numeric.reset();
+				_commit_group_transform();
+				return true;
+			}
+			if (mb->is_pressed() && mb->get_button_index() == MouseButton::RIGHT) {
+				numeric.reset();
+				_cancel_group_transform();
+				return true;
+			}
+			return true;
+		}
 
 		// Finish an in-progress group transform.
 		if (group_drag_active) {
@@ -920,7 +1081,10 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 	if (mm.is_valid()) {
 		Vector2 gpoint = mm->get_position();
 
-		if (group_drag_active) {
+		if (numeric.active) {
+			// Mouse movement is ignored while typing a numeric transform.
+			return true;
+		} else if (group_drag_active) {
 			_update_group_transform(gpoint, mm->is_shift_pressed());
 			return true;
 		} else if (box_selecting) {
@@ -998,6 +1162,9 @@ bool AbstractPolygon2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) 
 	Ref<InputEventKey> k = p_event;
 
 	if (k.is_valid() && k->is_pressed()) {
+		if (_handle_numeric_key(k)) {
+			return true;
+		}
 		if (k->get_keycode() == Key::KEY_DELETE || k->get_keycode() == Key::BACKSPACE) {
 			if (wip_active && selected_point.polygon == -1) {
 				if (wip.size() > selected_point.vertex) {
@@ -1168,6 +1335,14 @@ void AbstractPolygon2DEditor::forward_canvas_draw_over_viewport(Control *p_overl
 		const real_t basis_rot = canvas_item_editor->is_using_local_space() ? xform.get_rotation() : 0.0;
 		const PointTransformGizmo2D::HitType active_hit = group_drag_active ? group_hit : PointTransformGizmo2D::HitType::NONE;
 		PointTransformGizmo2D::draw_gizmo(p_overlay, gizmo_mode, pivot_screen, basis_rot, active_hit, group_drag_active ? group_scale_preview : Vector2());
+
+		// Show the value being typed for a numeric transform.
+		if (numeric.active) {
+			const String text = _numeric_display();
+			const Vector2 text_pos = pivot_screen + Vector2(18, -18) * EDSCALE;
+			p_overlay->draw_string_outline(font, text_pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, outline_size, outline_color);
+			p_overlay->draw_string(font, text_pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, font_color);
+		}
 	}
 
 	// Draw the box (rubber-band) selection rectangle.
@@ -1213,6 +1388,7 @@ void AbstractPolygon2DEditor::edit(Node *p_polygon) {
 		group_pivot_local = Vector2();
 		group_drag_active = false;
 		box_selecting = false;
+		numeric.reset();
 		center_drag = false;
 	} else {
 		_set_node(nullptr);

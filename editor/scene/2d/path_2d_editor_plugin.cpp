@@ -214,6 +214,16 @@ void Path2DEditor::_update_group_transform(const Vector2 &p_to_screen) {
 			return;
 	}
 
+	_apply_group_transform(translate, rotate, scale);
+}
+
+void Path2DEditor::_apply_group_transform(const Vector2 &p_translate, real_t p_rotate, const Vector2 &p_scale) {
+	Ref<Curve2D> curve = node->get_curve();
+	if (curve.is_null()) {
+		return;
+	}
+	const Vector2 pivot = group_drag_pivot_local;
+
 	// Apply to each selected point, transforming its in/out handles along with it.
 	for (const KeyValue<int, CurvePointState> &kv : group_pre_transform) {
 		const int idx = kv.key;
@@ -221,14 +231,14 @@ void Path2DEditor::_update_group_transform(const Vector2 &p_to_screen) {
 			continue;
 		}
 		const CurvePointState &st = kv.value;
-		const Vector2 new_pos = PointTransformGizmo2D::apply_transform(st.pos, pivot, group_mode, translate, rotate, scale);
+		const Vector2 new_pos = PointTransformGizmo2D::apply_transform(st.pos, pivot, group_mode, p_translate, p_rotate, p_scale);
 		curve->set_point_position(idx, new_pos);
 		if (group_mode == PointTransformGizmo2D::Mode::ROTATE) {
-			curve->set_point_in(idx, st.in.rotated(rotate));
-			curve->set_point_out(idx, st.out.rotated(rotate));
+			curve->set_point_in(idx, st.in.rotated(p_rotate));
+			curve->set_point_out(idx, st.out.rotated(p_rotate));
 		} else if (group_mode == PointTransformGizmo2D::Mode::SCALE) {
-			curve->set_point_in(idx, st.in * scale);
-			curve->set_point_out(idx, st.out * scale);
+			curve->set_point_in(idx, st.in * p_scale);
+			curve->set_point_out(idx, st.out * p_scale);
 		}
 	}
 
@@ -281,7 +291,7 @@ void Path2DEditor::_commit_group_transform() {
 }
 
 void Path2DEditor::_cancel_group_transform() {
-	if (!group_drag_active) {
+	if (!group_drag_active && !numeric.active) {
 		return;
 	}
 	group_drag_active = false;
@@ -299,6 +309,150 @@ void Path2DEditor::_cancel_group_transform() {
 	group_pre_transform.clear();
 	_update_group_pivot();
 	canvas_item_editor->update_viewport();
+}
+
+bool Path2DEditor::_handle_numeric_key(const Ref<InputEventKey> &p_key) {
+	if (p_key->is_echo()) {
+		return false;
+	}
+
+	const PointTransformGizmo2D::Mode gm = _get_gizmo_mode();
+	if (gm == PointTransformGizmo2D::Mode::NONE || selected_points.is_empty()) {
+		return false;
+	}
+	if (group_drag_active || box_selecting || action != ACTION_NONE) {
+		return false;
+	}
+
+	Ref<Curve2D> curve = node->get_curve();
+	if (curve.is_null()) {
+		return false;
+	}
+
+	const Key keycode = p_key->get_keycode();
+	const Key physical = p_key->get_physical_keycode();
+	const bool is_digit = (physical >= Key::KEY_0 && physical <= Key::KEY_9) || (keycode >= Key::KP_0 && keycode <= Key::KP_9);
+
+	if (!numeric.active) {
+		if (!is_digit && keycode != Key::MINUS && keycode != Key::KP_SUBTRACT && keycode != Key::PERIOD && physical != Key::KP_PERIOD) {
+			return false;
+		}
+		_update_group_pivot();
+		group_mode = gm;
+		group_hit = PointTransformGizmo2D::HitType::PLANE;
+		group_drag_pivot_local = _get_effective_pivot_local();
+		group_pre_transform.clear();
+		for (const int &idx : selected_points) {
+			if (idx >= 0 && idx < curve->get_point_count()) {
+				CurvePointState st;
+				st.pos = curve->get_point_position(idx);
+				st.in = curve->get_point_in(idx);
+				st.out = curve->get_point_out(idx);
+				group_pre_transform.insert(idx, st);
+			}
+		}
+		numeric.reset();
+		numeric.active = true;
+	}
+
+	if (is_digit) {
+		const uint32_t value = (physical >= Key::KEY_0 && physical <= Key::KEY_9) ? uint32_t(physical - Key::KEY_0) : uint32_t(keycode - Key::KP_0);
+		numeric.add_digit(value);
+	} else if (keycode == Key::MINUS || keycode == Key::KP_SUBTRACT) {
+		numeric.negate = !numeric.negate;
+	} else if (keycode == Key::PERIOD || physical == Key::KP_PERIOD) {
+		numeric.start_decimal();
+	} else if (keycode == Key::X) {
+		numeric.axis = (numeric.axis == 0) ? -1 : 0;
+	} else if (keycode == Key::Y) {
+		numeric.axis = (numeric.axis == 1) ? -1 : 1;
+	} else if (keycode == Key::ENTER || keycode == Key::KP_ENTER || keycode == Key::SPACE) {
+		_apply_numeric_transform();
+		numeric.reset();
+		_commit_group_transform();
+		return true;
+	} else if (keycode == Key::ESCAPE) {
+		numeric.reset();
+		_cancel_group_transform();
+		return true;
+	} else if (keycode == Key::BACKSPACE) {
+		const int saved_axis = numeric.axis;
+		numeric.reset();
+		numeric.active = true;
+		numeric.axis = saved_axis;
+	} else {
+		return false;
+	}
+
+	_apply_numeric_transform();
+	canvas_item_editor->update_viewport();
+	return true;
+}
+
+void Path2DEditor::_apply_numeric_transform() {
+	if (!numeric.active) {
+		return;
+	}
+	if (!numeric.has_input()) {
+		_apply_group_transform(Vector2(), 0.0, Vector2(1, 1));
+		return;
+	}
+
+	const double val = numeric.signed_value();
+	Vector2 translate;
+	real_t rotate = 0.0;
+	Vector2 scale = Vector2(1, 1);
+
+	switch (group_mode) {
+		case PointTransformGizmo2D::Mode::MOVE:
+			translate = (numeric.axis == 1) ? Vector2(0, val) : Vector2(val, 0);
+			break;
+		case PointTransformGizmo2D::Mode::ROTATE:
+			rotate = Math::deg_to_rad(val);
+			break;
+		case PointTransformGizmo2D::Mode::SCALE:
+			if (numeric.axis == 0) {
+				scale = Vector2(val, 1);
+			} else if (numeric.axis == 1) {
+				scale = Vector2(1, val);
+			} else {
+				scale = Vector2(val, val);
+			}
+			break;
+		default:
+			return;
+	}
+	_apply_group_transform(translate, rotate, scale);
+}
+
+String Path2DEditor::_numeric_display() const {
+	if (!numeric.active) {
+		return String();
+	}
+	String label;
+	switch (group_mode) {
+		case PointTransformGizmo2D::Mode::MOVE:
+			label = TTR("Move");
+			break;
+		case PointTransformGizmo2D::Mode::ROTATE:
+			label = TTR("Rotate");
+			break;
+		case PointTransformGizmo2D::Mode::SCALE:
+			label = TTR("Scale");
+			break;
+		default:
+			break;
+	}
+	if (group_mode != PointTransformGizmo2D::Mode::ROTATE && numeric.axis == 0) {
+		label += " X";
+	} else if (group_mode != PointTransformGizmo2D::Mode::ROTATE && numeric.axis == 1) {
+		label += " Y";
+	}
+	String num = numeric.has_input() ? String::num(numeric.signed_value()) : String("0");
+	if (group_mode == PointTransformGizmo2D::Mode::ROTATE) {
+		num += String::utf8("°");
+	}
+	return label + ": " + num;
 }
 
 void Path2DEditor::_delete_selected_points() {
@@ -360,6 +514,22 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 		cpoint = node->to_local(node->get_viewport()->get_popup_base_transform().affine_inverse().xform(cpoint));
 
 		const PointTransformGizmo2D::Mode gizmo_mode = _get_gizmo_mode();
+
+		// While a numeric transform is being typed, a click confirms it and a right-click cancels.
+		if (numeric.active) {
+			if (mb->is_pressed() && mb->get_button_index() == MouseButton::LEFT) {
+				_apply_numeric_transform();
+				numeric.reset();
+				_commit_group_transform();
+				return true;
+			}
+			if (mb->is_pressed() && mb->get_button_index() == MouseButton::RIGHT) {
+				numeric.reset();
+				_cancel_group_transform();
+				return true;
+			}
+			return true;
+		}
 
 		// Finish an in-progress group transform.
 		if (group_drag_active) {
@@ -642,6 +812,10 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 	Ref<InputEventMouseMotion> mm = p_event;
 
 	if (mm.is_valid()) {
+		if (numeric.active) {
+			// Mouse movement is ignored while typing a numeric transform.
+			return true;
+		}
 		if (group_drag_active) {
 			_update_group_transform(mm->get_position());
 			return true;
@@ -765,8 +939,11 @@ bool Path2DEditor::forward_gui_input(const Ref<InputEvent> &p_event) {
 	}
 
 	Ref<InputEventKey> k = p_event;
-	if (k.is_valid() && k->is_pressed() && !k->is_echo()) {
-		if ((k->get_keycode() == Key::KEY_DELETE || k->get_keycode() == Key::BACKSPACE) && !selected_points.is_empty()) {
+	if (k.is_valid() && k->is_pressed()) {
+		if (_handle_numeric_key(k)) {
+			return true;
+		}
+		if (!k->is_echo() && (k->get_keycode() == Key::KEY_DELETE || k->get_keycode() == Key::BACKSPACE) && !selected_points.is_empty()) {
 			_delete_selected_points();
 			return true;
 		}
@@ -982,6 +1159,18 @@ void Path2DEditor::forward_canvas_draw_over_viewport(Control *p_overlay) {
 		const real_t basis_rot = canvas_item_editor->is_using_local_space() ? xform.get_rotation() : 0.0;
 		const PointTransformGizmo2D::HitType active_hit = group_drag_active ? group_hit : PointTransformGizmo2D::HitType::NONE;
 		PointTransformGizmo2D::draw_gizmo(p_overlay, gizmo_mode, pivot_screen, basis_rot, active_hit, group_drag_active ? group_scale_preview : Vector2());
+
+		// Show the value being typed for a numeric transform.
+		if (numeric.active) {
+			Ref<Font> font = get_theme_font(SNAME("bold"), EditorStringName(EditorFonts));
+			const int font_size = get_theme_font_size(SNAME("bold_size"), EditorStringName(EditorFonts));
+			const Color font_color = get_theme_color(SceneStringName(font_color), EditorStringName(Editor));
+			const Color outline_color = font_color.inverted();
+			const String text = _numeric_display();
+			const Vector2 text_pos = pivot_screen + Vector2(18, -18) * EDSCALE;
+			p_overlay->draw_string_outline(font, text_pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, 4 * EDSCALE, outline_color);
+			p_overlay->draw_string(font, text_pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, font_color);
+		}
 	}
 
 	// Draw the box (rubber-band) selection rectangle.
@@ -1026,6 +1215,7 @@ void Path2DEditor::edit(Node *p_path2d) {
 	_clear_selection();
 	group_drag_active = false;
 	box_selecting = false;
+	numeric.reset();
 
 	if (p_path2d) {
 		node = Object::cast_to<Path2D>(p_path2d);

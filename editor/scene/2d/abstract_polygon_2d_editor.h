@@ -103,6 +103,9 @@ class AbstractPolygon2DEditor : public HBoxContainer {
 	Vector2 box_from_screen;
 	Vector2 box_to_screen;
 
+	// Blender-style numeric entry for the active transform tool.
+	PointTransformGizmo2D::NumericInput numeric;
+
 	Vector<Vector2> pre_move_edit;
 	Vector<Vector2> wip;
 	bool wip_active = false;
@@ -154,9 +157,13 @@ protected:
 	Vector2 _get_effective_pivot_local() const;
 	void _box_select_points(const Rect2 &p_screen_rect, bool p_append);
 	void _begin_group_transform(PointTransformGizmo2D::Mode p_mode, PointTransformGizmo2D::HitType p_hit, const Vector2 &p_from_screen);
+	void _apply_group_transform(const Vector2 &p_translate, real_t p_rotate, const Vector2 &p_scale);
 	void _update_group_transform(const Vector2 &p_to_screen, bool p_shift);
 	void _commit_group_transform();
 	void _cancel_group_transform();
+	bool _handle_numeric_key(const Ref<InputEventKey> &p_key);
+	void _apply_numeric_transform();
+	String _numeric_display() const;
 
 	bool _is_empty() const;
 

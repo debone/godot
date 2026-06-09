@@ -126,6 +126,8 @@ class Path2DEditor : public HBoxContainer {
 	Vector2 box_from_screen;
 	Vector2 box_to_screen;
 
+	PointTransformGizmo2D::NumericInput numeric;
+
 	PointTransformGizmo2D::Mode _get_gizmo_mode() const;
 	void _select_point(int p_idx, bool p_append);
 	void _clear_selection();
@@ -133,9 +135,13 @@ class Path2DEditor : public HBoxContainer {
 	Vector2 _get_effective_pivot_local() const;
 	void _box_select_points(const Rect2 &p_screen_rect, bool p_append);
 	void _begin_group_transform(PointTransformGizmo2D::Mode p_mode, PointTransformGizmo2D::HitType p_hit, const Vector2 &p_from_screen);
+	void _apply_group_transform(const Vector2 &p_translate, real_t p_rotate, const Vector2 &p_scale);
 	void _update_group_transform(const Vector2 &p_to_screen);
 	void _commit_group_transform();
 	void _cancel_group_transform();
+	bool _handle_numeric_key(const Ref<InputEventKey> &p_key);
+	void _apply_numeric_transform();
+	String _numeric_display() const;
 	void _delete_selected_points();
 
 	void _mode_selected(int p_mode);
